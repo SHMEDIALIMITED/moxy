@@ -1,25 +1,21 @@
-// Modified version of the original golang HTTP reverse proxy handler
-// Added support for Filter functions
-
 // Copyright 2011 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-package moxy
+// HTTP reverse proxy handler
+
+package httputil
 
 import (
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
 )
-
-// FilterFunc is a function that is called to process a proxy response
-// Since it has handle to the response object, it can manipulate the content
-type FilterFunc func(*http.Request, *http.Response)
 
 // onExitFlushLoop is a callback set by tests to detect the state of the
 // flushLoop() goroutine.
@@ -34,10 +30,6 @@ type ReverseProxy struct {
 	// using Transport. Its response is then copied
 	// back to the original client unmodified.
 	Director func(*http.Request)
-
-	// Filters must be an array of functions which modify
-	// the response before the body is written
-	Filters []FilterFunc
 
 	// The transport used to perform proxy requests.
 	// If nil, http.DefaultTransport is used.
@@ -54,6 +46,37 @@ type ReverseProxy struct {
 	// If nil, logging goes to os.Stderr via the log package's
 	// standard logger.
 	ErrorLog *log.Logger
+}
+
+func singleJoiningSlash(a, b string) string {
+	aslash := strings.HasSuffix(a, "/")
+	bslash := strings.HasPrefix(b, "/")
+	switch {
+	case aslash && bslash:
+		return a + b[1:]
+	case !aslash && !bslash:
+		return a + "/" + b
+	}
+	return a + b
+}
+
+// NewSingleHostReverseProxy returns a new ReverseProxy that rewrites
+// URLs to the scheme, host, and base path provided in target. If the
+// target's path is "/base" and the incoming request was for "/dir",
+// the target request will be for /base/dir.
+func NewSingleHostReverseProxy(target *url.URL) *ReverseProxy {
+	targetQuery := target.RawQuery
+	director := func(req *http.Request) {
+		req.URL.Scheme = target.Scheme
+		req.URL.Host = target.Host
+		req.URL.Path = singleJoiningSlash(target.Path, req.URL.Path)
+		if targetQuery == "" || req.URL.RawQuery == "" {
+			req.URL.RawQuery = targetQuery + req.URL.RawQuery
+		} else {
+			req.URL.RawQuery = targetQuery + "&" + req.URL.RawQuery
+		}
+	}
+	return &ReverseProxy{Director: director}
 }
 
 func copyHeader(dst, src http.Header) {
@@ -121,15 +144,11 @@ func (p *ReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 
 	res, err := transport.RoundTrip(outreq)
 	if err != nil {
-		log.Printf("http: proxy error: %v", err)
+		p.logf("http: proxy error: %v", err)
 		rw.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 	defer res.Body.Close()
-
-	for _, filterFn := range p.Filters {
-		filterFn(req, res)
-	}
 
 	for _, h := range hopHeaders {
 		res.Header.Del(h)
@@ -156,6 +175,14 @@ func (p *ReverseProxy) copyResponse(dst io.Writer, src io.Reader) {
 	}
 
 	io.Copy(dst, src)
+}
+
+func (p *ReverseProxy) logf(format string, args ...interface{}) {
+	if p.ErrorLog != nil {
+		p.ErrorLog.Printf(format, args...)
+	} else {
+		log.Printf(format, args...)
+	}
 }
 
 type writeFlusher interface {
